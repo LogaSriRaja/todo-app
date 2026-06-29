@@ -1,25 +1,26 @@
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import json
-import os
+import psycopg2
+import psycopg2.extras
 import requests
+import os
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
 
-TASKS_FILE = "tasks.json"
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-def load_tasks():
-    if os.path.exists(TASKS_FILE):
-        with open(TASKS_FILE, "r") as f:
-            return json.load(f)
-    return []
+DB_CONFIG = {
+    "host": "localhost",
+    "database": "tododb",
+    "user": "todouser",
+    "password": "todo123"
+}
 
-def save_tasks(tasks):
-    with open(TASKS_FILE, "w") as f:
-        json.dump(tasks, f)
+def get_db():
+    conn = psycopg2.connect(**DB_CONFIG)
+    return conn
 
 @app.route("/")
 def index():
@@ -27,47 +28,69 @@ def index():
 
 @app.route("/tasks", methods=["GET"])
 def get_tasks():
-    return jsonify(load_tasks())
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM tasks ORDER BY created_at DESC")
+    tasks = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify([dict(t) for t in tasks])
 
 @app.route("/tasks", methods=["POST"])
 def add_task():
     data = request.get_json()
-    tasks = load_tasks()
-    task = {
-        "id": len(tasks) + 1,
-        "title": data.get("title", ""),
-        "done": False
-    }
-    tasks.append(task)
-    save_tasks(tasks)
-    return jsonify(task), 201
+    title = data.get("title", "")
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "INSERT INTO tasks (title, done) VALUES (%s, %s) RETURNING *",
+        (title, False)
+    )
+    task = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify(dict(task)), 201
 
 @app.route("/tasks/<int:task_id>", methods=["PUT"])
 def update_task(task_id):
-    tasks = load_tasks()
-    for task in tasks:
-        if task["id"] == task_id:
-            task["done"] = not task["done"]
-            save_tasks(tasks)
-            return jsonify(task)
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "UPDATE tasks SET done = NOT done WHERE id = %s RETURNING *",
+        (task_id,)
+    )
+    task = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if task:
+        return jsonify(dict(task))
     return jsonify({"error": "Task not found"}), 404
 
 @app.route("/tasks/<int:task_id>", methods=["DELETE"])
 def delete_task(task_id):
-    tasks = load_tasks()
-    tasks = [t for t in tasks if t["id"] != task_id]
-    save_tasks(tasks)
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tasks WHERE id = %s", (task_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
     return jsonify({"message": "Deleted"})
 
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json()
     message = data.get("message", "")
-    tasks = load_tasks()
-    task_list = ", ".join([t["title"] for t in tasks]) if tasks else "No tasks yet"
 
-    system_prompt = f"""You are a helpful productivity assistant for a Todo app. 
-    The user currently has these tasks: {task_list}.
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT title FROM tasks WHERE done = FALSE")
+    tasks = cur.fetchall()
+    task_list = ", ".join([t["title"] for t in tasks]) if tasks else "No pending tasks"
+
+    system_prompt = f"""You are a helpful productivity assistant for a Todo app.
+    The user currently has these pending tasks: {task_list}.
     Help them manage their tasks, suggest priorities, and answer questions.
     Keep responses short and friendly."""
 
@@ -90,9 +113,29 @@ def chat():
         )
         result = response.json()
         reply = result["choices"][0]["message"]["content"]
+
+        cur.execute(
+            "INSERT INTO chats (user_message, ai_reply) VALUES (%s, %s)",
+            (message, reply)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
         return jsonify({"reply": reply})
     except Exception as e:
+        cur.close()
+        conn.close()
         return jsonify({"error": str(e)}), 500
+
+@app.route("/chats", methods=["GET"])
+def get_chats():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM chats ORDER BY created_at DESC LIMIT 50")
+    chats = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify([dict(c) for c in chats])
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
