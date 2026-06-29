@@ -23,6 +23,35 @@ def get_db():
     conn = psycopg2.connect(**DB_CONFIG)
     return conn
 
+def generate_session_name(user_message, ai_reply):
+    try:
+        response = requests.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Generate a very short 3-5 word title for this conversation. Only return the title, nothing else. No quotes, no punctuation."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"User said: {user_message}\nAI replied: {ai_reply}"
+                    }
+                ],
+                "max_tokens": 20
+            },
+            timeout=10
+        )
+        result = response.json()
+        return result["choices"][0]["message"]["content"].strip()
+    except:
+        return user_message[:30]
+
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
@@ -88,7 +117,7 @@ def get_sessions():
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""
-        SELECT DISTINCT ON (session_id) 
+        SELECT DISTINCT ON (session_id)
                session_id, session_name, created_at
         FROM chats
         WHERE session_id IS NOT NULL
@@ -98,6 +127,23 @@ def get_sessions():
     cur.close()
     conn.close()
     return jsonify([dict(s) for s in sessions])
+
+@app.route("/sessions/latest", methods=["GET"])
+def get_latest_session():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT session_id FROM chats
+        WHERE session_id IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT 1
+    """)
+    result = cur.fetchone()
+    cur.close()
+    conn.close()
+    if result:
+        return jsonify({"session_id": result["session_id"]})
+    return jsonify({"session_id": None})
 
 @app.route("/sessions/<session_id>", methods=["GET"])
 def get_session_chats(session_id):
@@ -129,7 +175,7 @@ def chat():
     data = request.get_json()
     message = data.get("message", "")
     session_id = data.get("session_id", str(uuid.uuid4()))
-    session_name = data.get("session_name", message[:30])
+    is_first_message = data.get("is_first_message", False)
 
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -162,14 +208,25 @@ def chat():
         result = response.json()
         reply = result["choices"][0]["message"]["content"]
 
+        session_name = message[:30]
+        if is_first_message:
+            session_name = generate_session_name(message, reply)
+
         cur.execute(
             "INSERT INTO chats (user_message, ai_reply, session_id, session_name) VALUES (%s, %s, %s, %s)",
             (message, reply, session_id, session_name)
         )
+
+        if is_first_message:
+            cur.execute(
+                "UPDATE chats SET session_name = %s WHERE session_id = %s",
+                (session_name, session_id)
+            )
+
         conn.commit()
         cur.close()
         conn.close()
-        return jsonify({"reply": reply, "session_id": session_id})
+        return jsonify({"reply": reply, "session_id": session_id, "session_name": session_name})
     except Exception as e:
         cur.close()
         conn.close()
