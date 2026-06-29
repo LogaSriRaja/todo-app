@@ -4,6 +4,7 @@ import psycopg2
 import psycopg2.extras
 import requests
 import os
+import uuid
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
@@ -25,6 +26,8 @@ def get_db():
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
+
+# ─── TASKS ───────────────────────────────────────────────
 
 @app.route("/tasks", methods=["GET"])
 def get_tasks():
@@ -78,10 +81,55 @@ def delete_task(task_id):
     conn.close()
     return jsonify({"message": "Deleted"})
 
+# ─── CHAT SESSIONS ───────────────────────────────────────
+
+@app.route("/sessions", methods=["GET"])
+def get_sessions():
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT DISTINCT ON (session_id) 
+               session_id, session_name, created_at
+        FROM chats
+        WHERE session_id IS NOT NULL
+        ORDER BY session_id, created_at DESC
+    """)
+    sessions = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify([dict(s) for s in sessions])
+
+@app.route("/sessions/<session_id>", methods=["GET"])
+def get_session_chats(session_id):
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT * FROM chats WHERE session_id = %s ORDER BY created_at ASC",
+        (session_id,)
+    )
+    chats = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify([dict(c) for c in chats])
+
+@app.route("/sessions/<session_id>", methods=["DELETE"])
+def delete_session(session_id):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM chats WHERE session_id = %s", (session_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"message": "Deleted"})
+
+# ─── CHAT ────────────────────────────────────────────────
+
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json()
     message = data.get("message", "")
+    session_id = data.get("session_id", str(uuid.uuid4()))
+    session_name = data.get("session_name", message[:30])
 
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -102,7 +150,7 @@ def chat():
                 "Content-Type": "application/json"
             },
             json={
-                "model": "llama3-8b-8192",
+                "model": "llama-3.3-70b-versatile",
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": message}
@@ -115,27 +163,17 @@ def chat():
         reply = result["choices"][0]["message"]["content"]
 
         cur.execute(
-            "INSERT INTO chats (user_message, ai_reply) VALUES (%s, %s)",
-            (message, reply)
+            "INSERT INTO chats (user_message, ai_reply, session_id, session_name) VALUES (%s, %s, %s, %s)",
+            (message, reply, session_id, session_name)
         )
         conn.commit()
         cur.close()
         conn.close()
-        return jsonify({"reply": reply})
+        return jsonify({"reply": reply, "session_id": session_id})
     except Exception as e:
         cur.close()
         conn.close()
         return jsonify({"error": str(e)}), 500
-
-@app.route("/chats", methods=["GET"])
-def get_chats():
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM chats ORDER BY created_at DESC LIMIT 50")
-    chats = cur.fetchall()
-    cur.close()
-    conn.close()
-    return jsonify([dict(c) for c in chats])
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
